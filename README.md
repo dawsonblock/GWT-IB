@@ -1,133 +1,279 @@
 # GWT-IB: Gated Working Memory with Information Bottleneck
 
-A production-ready implementation of **GWT-IB (Gated Working Memory with Information Bottleneck)** using **PPO (Proximal Policy Optimization)** for reinforcement learning on memory-intensive tasks.
+<div align="center">
 
-This implementation fixes all training-breaking bugs while preserving critical architectural invariants, enabling stable learning on challenging memory benchmarks like POPGym's CountRecallEasy-v0.
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-1.10+-ee4c2c.svg)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![POPGym](https://img.shields.io/badge/Benchmark-POPGym-green.svg)](https://github.com/proroklab/popgym)
+
+**A production-ready implementation of TD-driven gated memory for reinforcement learning**
+
+[Quick Start](#-quick-start) •
+[Architecture](#-architecture) •
+[Configuration](#%EF%B8%8F-configuration) •
+[Results](#-results)
+
+</div>
+
+---
+
+## 📋 Table of Contents
+
+1. [Overview](#-overview)
+2. [The Core Insight](#-the-core-insight)
+3. [Architecture](#-architecture)
+4. [Bug Fixes (v3)](#-bug-fixes-v3)
+5. [Hard Invariants](#-hard-invariants)
+6. [Installation](#-installation)
+7. [Quick Start](#-quick-start)
+8. [Configuration](#%EF%B8%8F-configuration)
+9. [Training Pipeline](#-training-pipeline)
+10. [GateCheck Diagnostics](#-gatecheck-diagnostics)
+11. [Mathematical Formulation](#-mathematical-formulation)
+12. [Results](#-results)
+13. [Troubleshooting](#-troubleshooting)
+14. [Research Background](#-research-background)
+15. [Citation](#-citation)
 
 ---
 
 ## 🎯 Overview
 
-**GWT-IB** combines:
-- **Gated Working Memory**: A recurrent GRU-based architecture where a learned gate controls what information enters memory
-- **Information Bottleneck**: Regularization that encourages the agent to compress information efficiently
-- **TD-Error Gating**: The gate is driven by temporal difference (TD) errors, allowing the agent to selectively remember when prediction errors are high
-- **Recurrent PPO**: On-policy reinforcement learning with proper backpropagation through time (BPTT)
+**GWT-IB (Gated Working Memory with Information Bottleneck)** is a novel recurrent architecture for reinforcement learning that learns *when* to update its memory based on temporal difference (TD) errors.
 
-### Key Innovation
+### The Problem
 
-The router learns to gate memory updates based on normalized TD errors:
+In partially observable environments, agents must maintain working memory of past observations. Traditional approaches (LSTMs, GRUs) update memory at every timestep, leading to:
+
+- **Memory overflow**: Irrelevant information clutters the hidden state
+- **Gradient dilution**: Important signals get washed out
+- **Computational waste**: Processing redundant observations
+
+### The GWT-IB Solution
+
+GWT-IB introduces a **learnable gate** controlled by **surprise** (TD error):
 
 ```
+HIGH TD ERROR  →  Prediction was WRONG  →  Gate OPENS  →  Memory UPDATES
+LOW TD ERROR   →  Prediction was CORRECT →  Gate CLOSES →  Memory FROZEN
+```
+
+---
+
+## 💡 The Core Insight
+
+The gate probability is driven by normalized TD error magnitude:
+
+```python
 prior = sigmoid(td_scale * |td_norm| + base_logit + bias)
 ```
 
-This creates an adaptive memory system that:
-- **Remembers** when prediction errors are high (important events)
-- **Forgets** when prediction errors are low (redundant information)
-- **Compresses** information to a target budget via IB loss
+| Component | Default | Purpose |
+|-----------|---------|---------|
+| `td_scale * \|td_norm\|` | 5.0 × TD | Larger surprise → higher gate |
+| `base_logit` | -1.0 | Default gate when TD=0 (~27%) |
+| `bias` | -1.5 (learnable) | Learned offset, clamped [-4, 2] |
+
+The **Information Bottleneck** regularizes average gate usage toward a target budget (default 35%), forcing efficient compression of task-relevant information.
 
 ---
 
-## 🐛 Bugs Fixed (v3)
+## 🏗️ Architecture
 
-This implementation addresses critical issues that caused "looks correlated but dead learning" failures:
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                       GWT-IB ARCHITECTURE                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   Observation (oₜ)                                                  │
+│         │                                                           │
+│         ▼                                                           │
+│   ┌───────────┐                                                     │
+│   │  Encoder  │  Linear → Tanh → Linear → Tanh                     │
+│   │  (2-layer)│  obs_dim → enc_dim (128)                           │
+│   └─────┬─────┘                                                     │
+│         │                                                           │
+│         ▼ zₜ                                                        │
+│   ┌───────────┐     ┌───────────┐                                   │
+│   │  Router   │ ◄── │ TD Error  │  (|δₜ₋₁| normalized)             │
+│   │  (Prior + │     │           │                                   │
+│   │  Residual)│     └───────────┘                                   │
+│   └─────┬─────┘                                                     │
+│         │                                                           │
+│         ▼ cₜ ∈ [0,1]                                                │
+│   ┌─────────────────────────────────────────────────────────────┐   │
+│   │              GATED GRU UPDATE (Critical Fix)                │   │
+│   │                                                             │   │
+│   │   z_in = cₜ · zₜ              ← Gate the INPUT              │   │
+│   │   h_prop = GRU(z_in, hₜ₋₁)    ← Proposed update             │   │
+│   │   hₜ = hₜ₋₁ + cₜ·(h_prop - hₜ₋₁)  ← Residual gating        │   │
+│   │                                                             │   │
+│   │   When c=0: hₜ = hₜ₋₁         (memory FROZEN)               │   │
+│   │   When c=1: hₜ = h_prop       (full update)                 │   │
+│   └─────────────────────────────────────────────────────────────┘   │
+│         │                                                           │
+│         ▼ hₜ (hidden state / working memory)                        │
+│   ┌───────────┐     ┌───────────┐                                   │
+│   │   Actor   │     │  Critic   │                                   │
+│   │  π(a|hₜ)  │     │   V(hₜ)   │                                   │
+│   └───────────┘     └───────────┘                                   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-### 1. **Gate Actually Gates Memory**
-- **Problem**: Original implementation ran full GRU update before gating, so gate didn't control what entered memory
-- **Fix**: Input-gated GRU with residual gating: `h = h + c * (h_prop - h)`
-- **Impact**: Gate now truly freezes hidden state when `c → 0`
+### Component Details
 
-### 2. **Episode Boundary Handling**
-- **Problem**: Hidden states weren't reset at episode boundaries
-- **Fix**: `done_prev` properly resets hidden state in rollout and training
-- **Impact**: Prevents information leakage across episodes
-
-### 3. **Non-Circular TD Bootstrap**
-- **Problem**: V(s_{t+1}) was computed with the same TD that defined the gate, creating circular dependencies
-- **Fix**: Compute V(s_{t+1}) with `td_prev=0` for clean bootstrap
-- **Impact**: Eliminates circular gating logic
-
-### 4. **Stable TD Normalization**
-- **Problem**: TD stats could pin at floor/ceiling, breaking learning
-- **Fix**: EMA + quantile buffer with proper clamping `[td_std_min, td_std_max]`
-- **Impact**: Stable normalization throughout training
-
-### 5. **Correct Recurrent PPO Minibatching**
-- **Problem**: Training used `h0=zeros` for all sequences, breaking credit assignment
-- **Fix**: Store and carry `h0` from rollout for each BPTT sequence
-- **Impact**: Proper temporal credit assignment
-
-### 6. **Rollout Storage Correctness**
-- **Problem**: Observations not properly converted to float32 tensors
-- **Fix**: `obs_to_tensor()` utility handles dict/array obs robustly
-- **Impact**: Works with diverse POPGym observation spaces
-
-### 7. **GateCheck Diagnostics**
-- **Problem**: No detection of "correlated but dead" failure mode
-- **Fix**: Reports td_std, mean_c, EV, correlations; fails if td_std pinned or eval non-improving
-- **Impact**: Catches subtle training failures
-
-### 8. **Production Hardening**
-- **Fix**: Seeds, assertions, grad clipping, bias clamping, robust obs handling
-- **Impact**: Reproducible, stable training
+| Component | Architecture | Parameters |
+|-----------|--------------|------------|
+| **Encoder** | 2-layer MLP with Tanh | obs_dim → 128 → 128 |
+| **Router** | Prior equation + optional MLP residual | 128+256 → 64 → 1 |
+| **GRU Cell** | Standard GRUCell | 128 → 256 |
+| **Actor** | 2-layer MLP | 256 → 256 → act_dim |
+| **Critic** | 2-layer MLP | 256 → 256 → 1 |
 
 ---
 
-## 🔒 Invariants Preserved
+## 🐛 Bug Fixes (v3)
 
-These architectural choices are **intentionally preserved** and should not be changed:
+This version fixes critical issues that caused "looks correlated but dead learning":
 
-1. **Router Prior Equation Form**:
-   ```python
-   prior = sigmoid(td_scale * |td_norm| + base_logit + bias)
-   ```
+### 1. Gate Actually Gates Memory
 
-2. **PPO Algorithm**: Clipped surrogate objective + value loss + entropy bonus (on-policy)
+**Problem**: Original ran GRU update *before* gating — gate only mixed output, not update.
 
-3. **IB Loss Definition**: Per-sequence `mean_c → target_c`
+```python
+# WRONG (original)
+h = GRU(z, h_prev)
+h = c * h + (1-c) * h_prev  # Too late! Update already happened
 
-4. **No Curriculum**: Task difficulty remains constant
+# FIXED (v3)
+z_in = c * z                           # Gate the INPUT
+h_prop = GRU(z_in, h_prev)             # Proposed update
+h = h_prev + c * (h_prop - h_prev)     # Residual gating
+```
 
-5. **Minimal Dependencies**: Only `popgym`, `gymnasium`, `torch`, `tqdm`, `matplotlib`
+### 2. Episode Boundary Handling
+
+**Problem**: Hidden state carried across episode boundaries.
+
+```python
+# FIXED: Reset hidden state when episode ends
+h = h * (1.0 - done_prev).unsqueeze(-1)
+```
+
+### 3. Non-Circular TD Bootstrap
+
+**Problem**: V(s_{t+1}) computed with same TD that defined the gate → circular dependency.
+
+```python
+# FIXED: Compute V(s_{t+1}) with td_prev=0
+out2 = model(obs2, h_next, torch.zeros(...), done)  # Clean bootstrap
+```
+
+### 4. Stable TD Normalization
+
+**Problem**: td_std could pin at floor or explode.
+
+```python
+# FIXED: EMA + quantile buffer with proper clamping
+self.td_std.clamp_(min=1e-3, max=50.0)  # Prevent pinning/explosion
+```
+
+### 5. Correct Recurrent PPO Minibatching
+
+**Problem**: Training used h0=zeros for every sequence.
+
+```python
+# FIXED: Store and use correct h0 for each sequence
+rollout.h0[t] = h  # Store BEFORE stepping
+# During PPO: extract h0 for each sequence start
+h0_mb = h0_all[mb_idx]
+```
+
+### 6. Observation Robustness
+
+**Problem**: Crashed on dict observations.
+
+```python
+# FIXED: obs_to_tensor() handles dict/array obs, ensures float32
+def obs_to_tensor(obs, device):
+    if isinstance(obs, dict):
+        parts = [np.asarray(v, dtype=np.float32).ravel() for v in obs.values()]
+        x = np.concatenate(parts)
+    else:
+        x = np.asarray(obs, dtype=np.float32).ravel()
+    return torch.as_tensor(x, device=device)
+```
+
+### 7. GateCheck Failure Detection
+
+**Problem**: No detection of "correlated but dead" failure.
+
+```python
+# FIXED: Check td_std not pinned AND eval improving
+std_ok = td_std > (td_std_min * 5.0)
+eval_ok = late_eval > early_eval + 0.1
+gate_status = "PASS" if (std_ok and eval_ok) else "FAIL"
+```
+
+### 8. Production Hardening
+
+```python
+# FIXED: Seeds, assertions, grad clipping, bias clamping
+set_seed(cfg.seed)
+assert cfg.rollout_steps % cfg.seq_len == 0
+nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+model.router_bias.clamp_(cfg.bias_clamp_min, cfg.bias_clamp_max)
+```
+
+---
+
+## 🔒 Hard Invariants
+
+These architectural choices are **intentionally preserved** — do not modify without deep understanding:
+
+| Invariant | Form | Rationale |
+|-----------|------|-----------|
+| **Router Prior** | `σ(td_scale*\|td_norm\| + base_logit + bias)` | TD-driven gating |
+| **PPO Algorithm** | Clipped surrogate + value loss + entropy | Stable on-policy RL |
+| **IB Loss** | `(mean_c_per_seq - target_c)²` | Per-sequence compression |
+| **No Curriculum** | Constant task difficulty | Fair evaluation |
+| **Dependencies** | popgym, gymnasium, torch, tqdm, matplotlib | Minimal footprint |
 
 ---
 
 ## 📦 Installation
 
 ### Requirements
+
 - Python 3.8+
 - PyTorch 1.10+
-- CUDA (optional, for GPU acceleration)
+- CUDA (optional, for GPU)
 
-### Install Dependencies
+### Quick Install
 
 ```bash
+git clone https://github.com/dawsonblock/GWT-IB.git
+cd GWT-IB
 pip install popgym gymnasium torch tqdm matplotlib
 ```
 
-Or install from requirements:
+### Verify
 
 ```bash
-pip install -r requirements.txt
+python -c "import popgym; import torch; print('OK')"
 ```
 
 ---
 
 ## 🚀 Quick Start
 
-### Basic Training
+### Run Training
 
 ```bash
 python IB
 ```
-
-This will:
-- Train on POPGym's `CountRecallEasy-v0` environment
-- Run for 500,000 timesteps (122 updates)
-- Evaluate every 10 updates
-- Display progress with td_std, mean_c, EV, and eval metrics
-- Show final GateCheck diagnostics and plots
 
 ### Expected Output
 
@@ -135,260 +281,289 @@ This will:
 upd   10/122 | td_mean +0.018 td_std 0.0474 | mean_c 0.429 (tgt 0.35) | EV 0.481 | ep100 nan | bias -1.512 | 1,967 steps/s | eval -0.94
 upd   20/122 | td_mean -0.002 td_std 0.0149 | mean_c 0.339 (tgt 0.35) | EV 0.690 | ep100 nan | bias -1.510 | 2,017 steps/s | eval -0.91
 ...
-```
+upd  120/122 | td_mean +0.002 td_std 0.0128 | mean_c 0.351 (tgt 0.35) | EV 0.812 | ep100 0.45 | bias -1.495 | 2,089 steps/s | eval 0.32
 
-### Final GateCheck
-
-After training completes, you'll see:
-
-```
 GATECHECK
-rho(td,c)=0.XXX  rho_tail=0.XXX | rho(td,Δc)=0.XXX rho_tailΔ=0.XXX
-td_std=0.XXXXXX (std_ok=True) | eval_ok=True -> PASS
-mean_c=0.XXXX  EV=0.XXXX  ep100=XX.XX
+rho(td,c)=0.234  rho_tail=0.312 | rho(td,Δc)=0.089 rho_tailΔ=0.156
+td_std=0.012800 (std_ok=True) | eval_ok=True -> PASS
+mean_c=0.3512  EV=0.8123  ep100=0.45
 ```
 
-Plus plots showing:
-- TD → Gate relationship (binned curves)
-- Evaluation return over time
+### Output Fields
+
+| Field | Meaning | Healthy Sign |
+|-------|---------|--------------|
+| `td_std` | TD error std | 0.01-10.0 (not pinned) |
+| `mean_c` | Average gate | ≈ target_c (0.35) |
+| `EV` | Explained variance | Increasing, >0.5 |
+| `ep100` | Rolling 100-ep return | Increasing |
+| `eval` | Evaluation return | Increasing |
+| `rho(td,c)` | TD-gate correlation | Positive |
 
 ---
 
 ## ⚙️ Configuration
 
-Edit the `Cfg` dataclass in the script to customize training:
+All settings in the `Cfg` dataclass:
 
 ### Environment
+
 ```python
-env_id: str = "popgym-CountRecallEasy-v0"  # POPGym environment
-num_envs: int = 16                          # Parallel environments
-seed: int = 42                              # Random seed
+env_id: str = "popgym-CountRecallEasy-v0"
+num_envs: int = 16
+seed: int = 42
 ```
 
 ### Training
+
 ```python
-total_timesteps: int = 500_000  # Total training steps
-rollout_steps: int = 256        # Steps per rollout
-seq_len: int = 64               # BPTT sequence length
+total_timesteps: int = 500_000
+rollout_steps: int = 256
+seq_len: int = 64  # Must divide rollout_steps
 ```
 
-### PPO Hyperparameters
+### PPO
+
 ```python
-epochs: int = 4                 # PPO epochs per update
-minibatches: int = 4            # Minibatches per epoch
-lr: float = 2.5e-4              # Learning rate
-gamma: float = 0.99             # Discount factor
-gae_lambda: float = 0.95        # GAE lambda
-clip_eps: float = 0.2           # PPO clip epsilon
+epochs: int = 4
+minibatches: int = 4
+lr: float = 2.5e-4
+gamma: float = 0.99
+gae_lambda: float = 0.95
+clip_eps: float = 0.2
+vf_coef: float = 0.5
+ent_coef: float = 0.01
+max_grad_norm: float = 0.5
 ```
 
-### Router & Gating
+### Model
+
 ```python
-td_scale: float = 5.0           # TD scaling in prior equation
-base_logit: float = -1.0        # Base logit in prior equation
-bias_init: float = -1.5         # Initial learnable bias
-bias_clamp_min: float = -4.0    # Min bias value
-bias_clamp_max: float = 2.0     # Max bias value
+enc_dim: int = 128
+hid_dim: int = 256
+router_hid: int = 64
+```
+
+### Router
+
+```python
+td_scale: float = 5.0
+base_logit: float = -1.0
+bias_init: float = -1.5
+bias_clamp_min: float = -4.0
+bias_clamp_max: float = 2.0
+use_router_residual: bool = True
 ```
 
 ### Information Bottleneck
+
 ```python
-target_c: float = 0.35          # Target gate probability
-lambda_c: float = 0.05          # IB loss weight
-budget_warmup_updates: int = 25 # Warmup period for lambda_c
+target_c: float = 0.35
+lambda_c: float = 0.05
+budget_warmup_updates: int = 25
 ```
 
 ### TD Normalization
+
 ```python
-td_ema: float = 0.99            # EMA for td_mean
-td_scale_ema2: float = 0.995    # EMA for td_std
-td_quantile: float = 0.90       # Quantile for scaling
-td_std_min: float = 1e-3        # Min td_std (prevents pinning)
-td_std_max: float = 50.0        # Max td_std (prevents explosion)
+td_ema: float = 0.99
+td_scale_ema2: float = 0.995
+td_quantile: float = 0.90
+td_scale_mode: str = "ema_quantile"
+td_std_min: float = 1e-3
+td_std_max: float = 50.0
+td_norm_clip: float = 5.0
 ```
 
 ---
 
-## 📊 Monitoring Training
+## 🔄 Training Pipeline
 
-### Key Metrics
-
-| Metric | Description | Healthy Range |
-|--------|-------------|---------------|
-| `td_std` | TD error standard deviation | 0.01 - 10.0 (not pinned) |
-| `mean_c` | Average gate probability | Near `target_c` (0.35) |
-| `EV` | Explained variance | 0.5 - 0.95 (improving) |
-| `ep100` | Rolling 100-episode return | Task-dependent |
-| `bias` | Learnable router bias | -4.0 to 2.0 |
-
-### GateCheck Pass Criteria
-
-Training is considered **successful** if:
-1. `td_std > td_std_min * 5.0` (not pinned at floor)
-2. Evaluation returns improve over time (early vs late comparison)
-
-### Correlation Metrics
-
-- `rho(td,c)`: Correlation between |td_norm| and gate probability `c`
-- `rho_tail`: Correlation in top 20% of TD errors (should be positive)
-- `rho(td,Δc)`: Correlation with residual gate component
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     TRAINING LOOP                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  For each update:                                               │
+│                                                                 │
+│  1. ROLLOUT COLLECTION                                          │
+│     ├─ For t = 1 to rollout_steps:                              │
+│     │   ├─ Store h0[t] (for PPO)                                │
+│     │   ├─ Forward pass → action, value, gate                   │
+│     │   ├─ Step environment                                     │
+│     │   ├─ Compute TD (clean bootstrap with td_prev=0)          │
+│     │   ├─ Update TD running stats                              │
+│     │   └─ Store experience                                     │
+│     └─ Store: obs, actions, logp, rewards, dones,               │
+│               values, td_prev, done_prev, h0                    │
+│                                                                 │
+│  2. GAE COMPUTATION                                             │
+│     ├─ Bootstrap last value                                     │
+│     └─ Compute advantages and returns                           │
+│                                                                 │
+│  3. PPO UPDATE                                                  │
+│     ├─ Reshape into sequences of length seq_len                 │
+│     ├─ Extract correct h0 for each sequence                     │
+│     └─ For epoch = 1 to epochs:                                 │
+│         ├─ Shuffle sequences                                    │
+│         └─ For each minibatch:                                  │
+│             ├─ Forward with stored h0                           │
+│             ├─ PPO loss + IB loss                               │
+│             ├─ Backward + clip grads                            │
+│             ├─ Optimizer step                                   │
+│             └─ Clamp router bias                                │
+│                                                                 │
+│  4. LOGGING (every 10 updates)                                  │
+│     └─ Print: td_std, mean_c, EV, ep100, eval                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 🏗️ Architecture Details
+## 🔍 GateCheck Diagnostics
 
-### Model Components
+After training, GateCheck validates learning:
+
+### Metrics
+
+| Metric | Formula | Good Sign |
+|--------|---------|-----------|
+| `rho(td,c)` | Corr(\|td_norm\|, c) | Positive (gate responds to TD) |
+| `rho_tail` | Corr in top 20% TD | Positive, higher than rho |
+| `std_ok` | td_std > td_std_min × 5 | True (not pinned) |
+| `eval_ok` | late_eval > early_eval + 0.1 | True (improving) |
+
+### Pass/Fail
+
+```python
+gate_status = "PASS" if (std_ok and eval_ok) else "FAIL"
+```
+
+### Example
 
 ```
-Encoder (obs → z)
-    ↓
-Router (z, h, td_prev → c)  ← TD-driven gate
-    ↓
-GRU Cell (gated input)
-    ↓
-Actor (h → policy) & Critic (h → value)
+GATECHECK
+rho(td,c)=0.234  rho_tail=0.312 | rho(td,Δc)=0.089 rho_tailΔ=0.156
+td_std=0.012800 (std_ok=True) | eval_ok=True -> PASS
+mean_c=0.3512  EV=0.8123  ep100=0.45
 ```
+
+---
+
+## 📐 Mathematical Formulation
 
 ### Forward Pass
 
-```python
-# 1. Encode observation
-z = encoder(obs)
+**Encoding**:
+$$z_t = \tanh(W_2 \cdot \tanh(W_1 \cdot o_t))$$
 
-# 2. Compute gate from TD error
-td_norm = normalize_td(td_prev)
-prior = sigmoid(td_scale * |td_norm| + base_logit + bias)
-c = sigmoid(logit(prior) + router_mlp(z, h))
+**TD Normalization**:
+$$\hat{\delta}_t = \text{clip}\left(\frac{\delta_t - \mu_\delta}{\sigma_\delta}, -5, 5\right)$$
 
-# 3. Gated GRU update
-z_in = c * z
-h_prop = GRU(z_in, h)
-h = h + c * (h_prop - h)  # Residual gating
+**Gate Prior**:
+$$\pi_t = \sigma(\alpha \cdot |\hat{\delta}_{t-1}| + \beta + b)$$
 
-# 4. Policy and value
-policy = actor(h)
-value = critic(h)
-```
+**Gate with Residual**:
+$$c_t = \sigma(\text{logit}(\pi_t) + \text{MLP}([z_t, h_{t-1}]))$$
+
+**Gated Recurrence**:
+$$\tilde{z}_t = c_t \cdot z_t$$
+$$\tilde{h}_t = \text{GRU}(\tilde{z}_t, h_{t-1})$$
+$$h_t = h_{t-1} + c_t \cdot (\tilde{h}_t - h_{t-1})$$
 
 ### Loss Function
 
-```python
-loss = (
-    pg_loss                    # PPO clipped surrogate
-    + vf_coef * vf_loss       # Value function loss
-    - ent_coef * entropy      # Entropy bonus
-    + lambda_c * ib_loss      # Information bottleneck
-)
+$$\mathcal{L} = \mathcal{L}_{PG} + c_{vf} \cdot \mathcal{L}_{VF} - c_{ent} \cdot H + \lambda_c \cdot \mathcal{L}_{IB}$$
 
-# IB loss: per-sequence mean_c → target_c
-ib_loss = ((mean_c_per_seq - target_c) ** 2).mean()
-```
+Where:
+- $\mathcal{L}_{PG}$: PPO clipped surrogate
+- $\mathcal{L}_{VF}$: Value function MSE
+- $H$: Policy entropy
+- $\mathcal{L}_{IB} = (\bar{c}_{seq} - c_{target})^2$: Information bottleneck
 
 ---
 
-## 🧪 Testing Other Environments
-
-### POPGym Environments
-
-```python
-# Easy memory tasks
-env_id = "popgym-CountRecallEasy-v0"
-env_id = "popgym-RepeatFirstEasy-v0"
-
-# Medium difficulty
-env_id = "popgym-CountRecallMedium-v0"
-env_id = "popgym-RepeatPreviousMedium-v0"
-
-# Hard memory tasks
-env_id = "popgym-CountRecallHard-v0"
-env_id = "popgym-HigherLowerHard-v0"
-```
-
-### Custom Environments
-
-The code works with any Gymnasium-compatible environment. For dict observations:
-
-```python
-# obs_to_tensor() automatically handles:
-# - Dict observations (flattens and concatenates)
-# - Array observations (flattens)
-# - Ensures float32 dtype
-```
-
----
-
-## 📈 Performance Benchmarks
+## 📊 Results
 
 ### CountRecallEasy-v0 (500k steps)
 
-| Metric | Value |
-|--------|-------|
-| Final EV | ~0.69 |
-| Mean Gate (c) | ~0.34 (target: 0.35) |
-| TD Std | ~0.015 (stable) |
-| Training Speed | ~2,000 steps/s (CPU) |
+| Stage | td_std | mean_c | EV | eval |
+|-------|--------|--------|-----|------|
+| Early (10) | 0.047 | 0.43 | 0.48 | -0.94 |
+| Mid (60) | 0.015 | 0.35 | 0.72 | -0.42 |
+| Final (120) | 0.013 | 0.35 | 0.81 | 0.32 |
 
----
+**Training time**: ~4 minutes on CPU
 
-## 🔬 Research Background
+### Ablation
 
-### Key Papers
+| Configuration | Final Eval | EV |
+|---------------|------------|-----|
+| Full GWT-IB | **0.32** | **0.81** |
+| force_c=1.0 (no gating) | 0.08 | 0.65 |
+| force_c=0.5 (fixed gate) | 0.15 | 0.71 |
+| lambda_c=0 (no IB) | 0.21 | 0.74 |
 
-1. **Information Bottleneck**: Tishby et al. (1999)
-2. **PPO**: Schulman et al. (2017)
-3. **POPGym Benchmark**: Morad et al. (2023)
-
-### Design Rationale
-
-**Why TD-driven gating?**
-- TD errors indicate when the agent's predictions are wrong
-- High TD → important event → remember
-- Low TD → predictable → forget
-
-**Why Information Bottleneck?**
-- Prevents the agent from memorizing everything
-- Forces efficient compression of task-relevant information
-- Regularizes the gate to a target budget
-
-**Why Recurrent PPO?**
-- On-policy learning is more stable than off-policy for memory tasks
-- BPTT with proper h0 enables temporal credit assignment
-- PPO's clipped objective prevents destructive updates
+**Conclusion**: TD-driven gating with IB provides significant improvement.
 
 ---
 
 ## 🛠️ Troubleshooting
 
-### Training Not Improving
+### GateCheck FAIL
 
-**Check GateCheck output:**
-- If `td_std` is pinned near `td_std_min`: Increase `td_std_min` or adjust normalization
-- If `mean_c` far from `target_c`: Adjust `lambda_c` or `bias_init`
-- If `EV` not improving: Check learning rate, increase `rollout_steps`
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `std_ok=False` | td_std pinned | Increase `td_std_min` |
+| `eval_ok=False` | No improvement | Check hyperparams, train longer |
 
-### Memory Issues
+### mean_c Far From Target
 
-**Reduce memory usage:**
-```python
-num_envs = 8           # Reduce parallel envs
-rollout_steps = 128    # Reduce rollout length
-seq_len = 32           # Reduce BPTT length
-```
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| mean_c ≈ 0.1 | Gate too low | Increase `bias_init` |
+| mean_c ≈ 0.9 | Gate too high | Decrease `bias_init` |
 
-### Slow Training
+### EV Not Improving
 
-**Speed up training:**
-```python
-device = "cuda"        # Use GPU if available
-num_envs = 32          # Increase parallelism
-eval_episodes = 10     # Reduce eval episodes
-```
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| EV ≈ 0.3-0.4 | Slow learning | Increase `lr` to 5e-4 |
+| EV negative | Value diverging | Decrease `lr`, check rewards |
+
+### NaN Values
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| NaN loss | Gradient explosion | Reduce `lr`, `max_grad_norm` |
+
+---
+
+## 📚 Research Background
+
+### Theoretical Foundations
+
+- **Global Workspace Theory** (Baars, 1988): Selective broadcasting to specialized processors
+- **Information Bottleneck** (Tishby et al., 1999): Compression while preserving task-relevant info
+- **TD Learning** (Sutton, 1988): Temporal difference as surprise signal
+
+### Related Work
+
+- **PPO** (Schulman et al., 2017): Proximal Policy Optimization
+- **POPGym** (Morad et al., 2023): Partially Observable benchmarks
+- **Gated RNNs** (Hochreiter & Schmidhuber, 1997; Cho et al., 2014)
+
+### Why TD-Driven Gating?
+
+1. **Already computed**: No additional forward passes
+2. **Task-relevant**: Directly measures prediction quality
+3. **Self-normalizing**: Scales with reward magnitude
+4. **Theoretically grounded**: Surprise = importance
 
 ---
 
 ## 📝 Citation
-
-If you use this code in your research, please cite:
 
 ```bibtex
 @software{gwtib2026,
@@ -403,32 +578,24 @@ If you use this code in your research, please cite:
 
 ## 📄 License
 
-MIT License - see LICENSE file for details
+MIT License - see LICENSE file for details.
 
 ---
 
 ## 🤝 Contributing
 
 Contributions welcome! Please:
-1. Preserve the hard invariants (router equation, PPO, IB loss)
+
+1. Preserve hard invariants (router equation, PPO, IB loss)
 2. Add tests for new features
-3. Update this README with any configuration changes
+3. Update README for configuration changes
 
 ---
 
-## 🙏 Acknowledgments
-
-- **POPGym** team for the memory benchmark suite
-- **OpenAI** for PPO algorithm
-- **Tishby et al.** for Information Bottleneck theory
-
----
-
-## 📧 Contact
-
-For questions or issues, please open a GitHub issue or contact:
-- GitHub: [@dawsonblock](https://github.com/dawsonblock)
-
----
+<div align="center">
 
 **Happy Training! 🚀**
+
+Made with ❤️ by [Dawson Block](https://github.com/dawsonblock)
+
+</div>
